@@ -23,7 +23,7 @@ OctavioValdiviaMendoza
 
 **Claim comment**
 
-PASTE YOUR CLAIM COMMENT PERMALINK HERE
+https://github.com/codepath/pathreview-ai301-fa26-s3/issues/35#issuecomment-5988938947
 
 I’d like to investigate issue #35, which proposes adding a webhook endpoint where clients can register a callback URL and receive a POST containing the review payload after long-running, multi-repository reviews are complete.
 
