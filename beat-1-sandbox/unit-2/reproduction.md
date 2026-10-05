@@ -31,9 +31,90 @@ I’ll review the current FastAPI review-processing flow and the relevant areas 
 
 **Reproduction comment**
 
-PASTE YOUR REPRODUCTION COMMENT PERMALINK HERE
+https://github.com/codepath/pathreview-ai301-fa26-s3/issues/35#issuecomment-5989801874
 
-PASTE THE EXACT REPRODUCTION COMMENT YOU POSTED HERE
+### Environment
+
+Windows 11 Home 10.0.26200, Git Bash; Docker 28.5.1 / Compose v2.40.3; Postgres 16.15; Python 3.12.10; FastAPI 0.142.2, Uvicorn 0.54.0; upstream `main` at `2f4e82f`; `LLM_PROVIDER=mock` (`.env.example` default).
+
+### Steps
+
+With `API=http://127.0.0.1:8000`, from the repo root:
+
+1. `cp .env.example .env && docker compose up -d db redis`
+2. `python -m venv .venv && .venv/Scripts/pip install -e ".[dev]" && .venv/Scripts/alembic upgrade head && PYTHONIOENCODING=utf-8 .venv/Scripts/python scripts/seed_db.py` (I only need the API here, so I didn't install the frontend or the pre-commit hooks.)
+3. `.venv/Scripts/uvicorn api.main:app --host 127.0.0.1 --port 8000`
+4. In another terminal, `.venv/Scripts/python listener.py 20`, which logs any POST to `127.0.0.1:9999` for 20 s:
+
+   ```python
+   import sys, threading
+   from datetime import datetime
+   from http.server import BaseHTTPRequestHandler, HTTPServer
+
+   SECONDS = int(sys.argv[1]) if len(sys.argv) > 1 else 20
+
+   class Handler(BaseHTTPRequestHandler):
+       def do_POST(self):
+           body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+           print(f"[{datetime.now():%H:%M:%S.%f}] POST {self.path} {body.decode(errors='replace')}", flush=True)
+           self.send_response(200)
+           self.end_headers()
+
+       def log_message(self, *args):
+           pass
+
+   server = HTTPServer(("127.0.0.1", 9999), Handler)
+   print("listening on 127.0.0.1:9999", flush=True)
+   threading.Timer(SECONDS, server.shutdown).start()
+   server.serve_forever()
+   print(f"listener closed after {SECONDS}s", flush=True)
+   ```
+
+5. Get the seeded profile ID (there is no list-profiles route):
+   `docker compose exec -T db psql -U pathreview -d pathreview_dev -tAc "SELECT p.id FROM profiles p JOIN users u ON u.id = p.user_id WHERE u.email = 'user1@example.com';"` → `fe1307a6-1c48-4c51-80ea-972d2c4ce401`
+6. Log in (form-encoded, seeded credentials from `docs/SETUP.md`):
+   `TOKEN=$(curl -s -X POST $API/auth/login -d "username=user1@example.com&password=password1" | python -c "import json,sys; print(json.load(sys.stdin)['access_token'])")`
+7. Create a review with a `callback_url`, poll `GET /reviews/{id}/status` 5 times, then try `POST /webhooks` and `POST /reviews/{id}/webhooks`, all with `-H "Authorization: Bearer $TOKEN"`.
+
+### What I observed
+
+`/openapi.json` has no webhook or callback route:
+
+```
+POST /auth/register, POST /auth/login, POST /profiles, GET|PUT|DELETE /profiles/{profile_id},
+POST /reviews, GET /reviews, GET /reviews/{review_id}, GET /reviews/{review_id}/status, GET /health, GET /
+```
+
+The review was accepted, and `callback_url` was silently dropped (`ReviewCreate` only has `profile_id`):
+
+```
+$ curl -s -w '\n  HTTP %{http_code}' -X POST $API/reviews -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{"profile_id": "fe1307a6-1c48-4c51-80ea-972d2c4ce401", "callback_url": "http://127.0.0.1:9999/hook"}'
+  {"id":"825f1dd3-c755-48b4-bb18-ea23f5057922","profile_id":"fe1307a6-1c48-4c51-80ea-972d2c4ce401","status":"pending","sections":null,"overall_score":null,"error_message":null,"created_at":"2026-10-05T13:47:36.758226Z","updated_at":"2026-10-05T13:47:36.758226Z"}
+  HTTP 200
+```
+
+It completed, which I could only find out by polling:
+
+```
+  [23:47:37.292] {"review_id":"825f1dd3-c755-48b4-bb18-ea23f5057922","status":"complete","progress_pct":0}
+```
+
+Nothing reached the listener, and both webhook routes are 404:
+
+```
+listening on 127.0.0.1:9999
+listener closed after 20s
+
+POST /webhooks                                              -> HTTP 404
+POST /reviews/825f1dd3-c755-48b4-bb18-ea23f5057922/webhooks -> HTTP 404
+```
+
+`process_review()` in `core/services/review_service.py` sets `status = "complete"`, commits, and logs. It has no notification step, and `grep -rni webhook` finds nothing in the Python code.
+
+### Outcome
+
+I reproduced the missing capability: a client can't register a callback URL, nothing is sent on completion, and polling is the only option. I could **not** reproduce the 30–90 s processing time. With `LLM_PROVIDER=mock`, this review completed in about 119 ms (`created_at` …36.758 → `updated_at` …36.877). Testing the long-review case will need a real provider or an artificial delay.
+
 
 ---
 
